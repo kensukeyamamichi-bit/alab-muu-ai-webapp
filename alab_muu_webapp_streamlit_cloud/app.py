@@ -29,6 +29,8 @@ def download_data(tickers: List[str], period: str = "2y") -> Dict[str, pd.DataFr
 
 def add_indicators(df, qqq=None, soxx=None):
     d = df.copy()
+    d["MA5"] = d["Close"].rolling(5).mean()
+    d["MA10"] = d["Close"].rolling(10).mean()
     d["MA20"] = d["Close"].rolling(20).mean()
     d["MA50"] = d["Close"].rolling(50).mean()
     d["MA200"] = d["Close"].rolling(200).mean()
@@ -43,6 +45,7 @@ def add_indicators(df, qqq=None, soxx=None):
     d["High52W"] = d["High"].rolling(252, min_periods=30).max()
     d["Drawdown52W"] = (d["Close"] / d["High52W"] - 1) * 100
     d["Is52WHigh"] = d["Close"] >= d["High52W"].shift(1)
+    d["AboveMA5"] = d["Close"] > d["MA5"]
     d["AboveMA20"] = d["Close"] > d["MA20"]
     d["AboveMA50"] = d["Close"] > d["MA50"]
     d["AboveMA200"] = d["Close"] > d["MA200"]
@@ -117,6 +120,13 @@ def health_score(d):
     if pd.notna(vol):
         if vol > 2 and latest["Ret1D"] > 0: score += 5; notes.append("出来高を伴う上昇")
         elif vol > 2 and latest["Ret1D"] < 0: score -= 12; notes.append("出来高を伴う下落")
+    gap5 = latest.get("GapMA5", np.nan)
+    gap20 = latest.get("GapMA20", np.nan)
+    if pd.notna(gap5) and gap5 > 10:
+        score -= 8; notes.append("5MAから過熱")
+    if pd.notna(gap20) and gap20 > 18:
+        score -= 8; notes.append("20MAから過熱")
+
     dd = latest.get("Drawdown52W", np.nan)
     if pd.notna(dd):
         if dd > -5: score += 5; notes.append("高値圏維持")
@@ -202,6 +212,55 @@ def profit_taking_table(d, gain_levels=(5,10,15,20,25,30), gain_days=5, lookahea
         avg_up=events[up_col].mean(); avg_pull=events[pull_col].mean(); avg_high=events["高値までの日数"].mean()
         judge="利確強め" if avg_up<=3 and abs(avg_pull)>=6 else "一部利確" if avg_up<=5 and abs(avg_pull)>=5 else "保有余地"
         rows.append({"急騰条件": f"{gain_days}日で+{g}%", "件数":len(events), "平均追加上昇%":avg_up, "平均最大押し%":avg_pull, "平均高値日数":avg_high, "利確判定":judge})
+    return pd.DataFrame(rows)
+
+
+def ma_gap_profit_stats(d, ma=5, thresholds=(3,5,8,10,12,15), lookahead=10, min_gap=5):
+    gap_col = f"GapMA{ma}"
+    rows = []
+    for th in thresholds:
+        idxs = np.where((d[gap_col] >= th).fillna(False).values)[0]
+        vals, pulls, days_to_high, days_to_low = [], [], [], []
+        last_idx = -10**9
+        count = 0
+        for idx in idxs:
+            if idx - last_idx < min_gap:
+                continue
+            if idx + 1 >= len(d):
+                continue
+            future = d.iloc[idx+1:min(idx+lookahead+1, len(d))]
+            if future.empty:
+                continue
+            close = float(d["Close"].iloc[idx])
+            max_up = (float(future["High"].max()) / close - 1) * 100
+            min_down = (float(future["Low"].min()) / close - 1) * 100
+            high_date = future["High"].idxmax()
+            low_date = future["Low"].idxmin()
+            vals.append(max_up); pulls.append(min_down)
+            days_to_high.append(int(future.index.get_loc(high_date)+1))
+            days_to_low.append(int(future.index.get_loc(low_date)+1))
+            count += 1; last_idx = idx
+        avg_up = np.mean(vals) if vals else np.nan
+        avg_pull = np.mean(pulls) if pulls else np.nan
+        if count == 0:
+            judge = "-"
+        elif pd.notna(avg_up) and pd.notna(avg_pull) and avg_up <= 3 and abs(avg_pull) >= 5:
+            judge = "利確強め"
+        elif pd.notna(avg_up) and pd.notna(avg_pull) and avg_up <= 5 and abs(avg_pull) >= 5:
+            judge = "一部利確"
+        elif pd.notna(avg_up) and avg_up > abs(avg_pull):
+            judge = "保有余地"
+        else:
+            judge = "警戒"
+        rows.append({
+            f"{ma}MA乖離条件": f"+{th}%以上",
+            "件数": count,
+            f"{lookahead}日内 平均追加上昇%": avg_up,
+            f"{lookahead}日内 平均最大押し%": avg_pull,
+            "平均高値日数": np.mean(days_to_high) if days_to_high else np.nan,
+            "平均押し日数": np.mean(days_to_low) if days_to_low else np.nan,
+            "利確判定": judge
+        })
     return pd.DataFrame(rows)
 
 def profit_signal(d, gain_days=5):
