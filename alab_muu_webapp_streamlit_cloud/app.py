@@ -7,10 +7,10 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v7", layout="wide")
+st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v8", layout="wide")
 
 st.markdown("""
-# ALAB/MUU Buy-Sell Matrix v7
+# ALAB/MUU Buy-Sell Matrix v8
 **買いポイント**と**利確ポイント**を同じ画面で見る版。  
 目的：  
 - 買い：押し目・期待値・トレンド維持  
@@ -193,6 +193,85 @@ def capital_flow_score(d):
 
     return int(max(0, min(100, score))), notes, dist_count
 
+
+def pullback_quality_score(d):
+    """週足/日足の押し目買い思想を日足データで近似。
+    高値追いではなく、強いトレンド内で短期線〜中期線に近づいた時を高評価。
+    """
+    latest = d.iloc[-1]
+    score = 45
+    notes = []
+
+    close = latest["Close"]
+    gap5 = latest.get("GapMA5", np.nan)
+    gap20 = latest.get("GapMA20", np.nan)
+    gap50 = latest.get("GapMA50", np.nan)
+    rs20 = latest.get("RS_QQQ_20D", np.nan)
+    vol = latest.get("VolRatio20", np.nan)
+
+    # トレンド前提
+    if bool(latest.get("AboveMA50", False)) and bool(latest.get("AboveMA200", False)):
+        score += 20; notes.append("中長期トレンド上")
+    else:
+        score -= 25; notes.append("中長期トレンド弱い")
+
+    # 押し目の位置。5MA乖離が大きい時は追いかけ買いではない。
+    if pd.notna(gap5):
+        if -2 <= gap5 <= 3:
+            score += 25; notes.append("5MA付近の浅い押し")
+        elif 3 < gap5 <= 7:
+            score += 10; notes.append("5MA上だがまだ許容")
+        elif gap5 > 10:
+            score -= 30; notes.append("5MAから上方乖離、追いかけ買い注意")
+        elif gap5 < -5:
+            score -= 10; notes.append("5MA下で短期弱含み")
+
+    if pd.notna(gap20):
+        if 0 <= gap20 <= 8:
+            score += 18; notes.append("20MA上の良い押し目")
+        elif gap20 > 20:
+            score -= 15; notes.append("20MAからも過熱")
+        elif gap20 < 0:
+            score -= 10; notes.append("20MA割れ")
+
+    if pd.notna(rs20):
+        if rs20 > 10:
+            score += 10; notes.append("RS強い")
+        elif rs20 < 0:
+            score -= 10; notes.append("RS弱い")
+
+    if pd.notna(vol):
+        if vol >= 1.2 and latest.get("Ret1D", 0) > 0:
+            score += 7; notes.append("反発出来高あり")
+        elif vol >= 1.5 and latest.get("Ret1D", 0) < 0:
+            score -= 12; notes.append("下落出来高あり")
+
+    score = int(max(0, min(100, score)))
+    if score >= 80:
+        label = "S級押し目"
+    elif score >= 65:
+        label = "A級押し目"
+    elif score >= 50:
+        label = "B級・様子見"
+    else:
+        label = "追いかけ/弱い押し目"
+    return score, label, notes
+
+def full_exit_conditions(d, heat, flow, dist_days):
+    """全利確優位は、過熱だけでは出さない。4条件中3つ以上で判定。"""
+    latest = d.iloc[-1]
+    conds = []
+    conds.append(("利確過熱度90以上", heat >= 90))
+    conds.append(("資金流入スコア50以下", flow <= 50))
+    conds.append(("Distribution Day 4日以上", dist_days >= 4))
+    trend_bad = False
+    if pd.notna(latest.get("MA20", np.nan)):
+        trend_bad = latest["Close"] < latest["MA20"]
+    # 追加で5MA/20MAの短期崩れも補助条件にするが、単独では弱い
+    conds.append(("20MA終値割れ", trend_bad))
+    count = sum(v for _, v in conds)
+    return count, conds
+
 def flow_label(flow, heat, dist_days):
     if heat >= 85 and flow >= 75 and dist_days <= 2:
         return "🟢 過熱だが機関はまだ買っている"
@@ -206,44 +285,85 @@ def flow_label(flow, heat, dist_days):
         return "🟡 資金流入が鈍化"
     return "🟡 買いと売りが拮抗"
 
-def final_action_v7(buy, heat, flow=80, dist_days=0):
-    # 全利確はかなり厳格にする。過熱だけでは全利確にしない。
-    if heat >= 85 and flow < 60 and dist_days >= 4:
-        return "全利確優位", "過熱に加えて資金流出とDistribution Day増加。トレンド終了リスクが高い。"
-    if heat >= 85 and flow >= 75 and dist_days <= 2:
-        return "部分利確＋保有", "過熱だが機関はまだ買っている。20〜40%利確し、残りはトレールで上値追随。"
-    if heat >= 85:
-        return "強い利確候補", "短期過熱が強い。全利確ではなく、まず20〜40%の利益確定を検討。"
+def final_action_v8(d, buy, heat, flow=80, dist_days=0):
+    # 全利確は4条件中3つ以上。過熱だけでは絶対に全利確にしない。
+    exit_count, exit_conds = full_exit_conditions(d, heat, flow, dist_days)
+    pull_score, pull_label, pull_notes = pullback_quality_score(d)
+
+    if exit_count >= 3:
+        return "全利確優位", "過熱だけでなく、資金流出・Distribution Day・20MA割れのうち複数が重なっています。トレンド終了リスクが高いため全利確を検討。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
+    if heat >= 85 and flow >= 70 and dist_days <= 3:
+        return "部分利確＋保有", "短期過熱。ただし資金流入はまだ残っています。全利確ではなく、20〜40%利確＋残りトレールが基本。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
+    if heat >= 90:
+        return "強い利確候補", "短期過熱は強いです。ただし全利確条件は未達。まず20〜40%の利益確定を検討。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
     if buy >= 75 and heat < 55 and flow >= 60:
-        return "買い優位", "押し目買い候補。資金流入が維持されていれば分割で検討。"
+        return "買い優位", "押し目買い候補。資金流入が維持されていれば分割で検討。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
+    if pull_score >= 75 and heat < 70 and flow >= 60:
+        return "押し目買い候補", f"{pull_label}。トレンド内の押し目として質が高いです。分割エントリー候補。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
     if buy >= 65 and heat < 70:
-        return "分割買い候補", "買いすぎず分割。高値掴みを避ける。"
+        return "分割買い候補", "買いすぎず分割。高値掴みを避ける。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
     if heat >= 70:
-        return "一部利確", "利益の20〜30%確定を検討。残りは保有継続。"
+        return "一部利確", "利益の20〜30%確定を検討。残りは保有継続。", exit_count, exit_conds, pull_score, pull_label, pull_notes
+
     if buy < 45 and heat < 55:
-        return "待機", "無理しない。明確な資金流入か押し目を待つ。"
-    return "保有", "トレンド継続。売買せず観察。"
+        return "待機", "無理しない。明確な資金流入か押し目を待つ。", exit_count, exit_conds, pull_score, pull_label, pull_notes
 
-def action_box(action, comment, flow_text, flow_notes, dist_days):
-    notes = " / ".join(flow_notes[:5]) if flow_notes else "-"
-    if action in ["部分利確＋保有", "買い優位", "保有"]:
-        box = st.success
-    elif action in ["全利確優位", "強い利確候補"]:
-        box = st.error if action == "全利確優位" else st.warning
-    else:
-        box = st.warning if action in ["一部利確", "分割買い候補"] else st.info
-    box(f"""
-### 最終判断：{action}
+    return "保有", "トレンド継続。売買せず観察。", exit_count, exit_conds, pull_score, pull_label, pull_notes
 
-**現在の需給判定**  
-{flow_text}
+def action_box(action, comment, flow_text, flow_notes, dist_days, exit_count=None, exit_conds=None, pull_score=None, pull_label=None, pull_notes=None):
+    notes = " / ".join(flow_notes[:6]) if flow_notes else "-"
+    cond_text = ""
+    if exit_conds is not None:
+        cond_rows = []
+        for name, ok in exit_conds:
+            mark = "✅" if ok else "—"
+            cond_rows.append(f"<li>{mark} {name}</li>")
+        cond_text = f"""
+        <div class="small-title">全利確チェック：{exit_count}/4</div>
+        <ul>{''.join(cond_rows)}</ul>
+        """
+    pull_text = ""
+    if pull_score is not None:
+        pnotes = " / ".join((pull_notes or [])[:5]) or "-"
+        pull_text = f"""
+        <div class="small-title">押し目品質：{pull_score}/100｜{pull_label}</div>
+        <div class="muted">{pnotes}</div>
+        """
 
-**コメント**  
-{comment}
+    bg = "#ecfdf5" if action in ["部分利確＋保有", "買い優位", "保有", "押し目買い候補"] else "#fffbeb"
+    border = "#10b981" if action in ["部分利確＋保有", "買い優位", "保有", "押し目買い候補"] else "#f59e0b"
+    if action == "全利確優位":
+        bg, border = "#fef2f2", "#ef4444"
 
-**Distribution Day：{dist_days}日 / 直近25営業日**  
-**資金フロー根拠**：{notes}
-""")
+    st.markdown(f"""
+    <style>
+      .decision-card {{
+        background:{bg}; border:1px solid {border}; border-radius:16px; padding:20px 22px;
+        margin:12px 0 18px 0; line-height:1.75; white-space:normal; overflow-wrap:anywhere;
+      }}
+      .decision-title {{font-size:28px; font-weight:800; margin-bottom:8px;}}
+      .small-title {{font-size:17px; font-weight:700; margin-top:12px;}}
+      .muted {{color:#374151;}}
+      .decision-card ul {{margin-top:4px;}}
+    </style>
+    <div class="decision-card">
+      <div class="decision-title">最終判断：{action}</div>
+      <div class="small-title">現在の需給判定</div>
+      <div>{flow_text}</div>
+      <div class="small-title">コメント</div>
+      <div>{comment}</div>
+      <div class="small-title">Distribution Day：{dist_days}日 / 直近25営業日</div>
+      <div class="muted">資金フロー根拠：{notes}</div>
+      {cond_text}
+      {pull_text}
+    </div>
+    """, unsafe_allow_html=True)
 
 def health_score(d):
     latest = d.iloc[-1]
@@ -495,17 +615,18 @@ buy, buy_reasons = buy_score(d)
 sell_judge, heat, sell_reasons = sell_heat(d, gain_days=surge_days)
 flow, flow_notes, dist_days = capital_flow_score(d)
 flow_text = flow_label(flow, heat, dist_days)
-action, action_note = final_action_v7(buy, heat, flow, dist_days)
+action, action_note, exit_count, exit_conds, pull_score, pull_label, pull_notes = final_action_v8(d, buy, heat, flow, dist_days)
 health, health_notes = health_score(d)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("最終行動", action)
 c2.metric("買いスコア", f"{buy}/100")
 c3.metric("利確過熱度", f"{heat:.0f}/100", sell_judge)
 c4.metric("健康スコア", f"{health}/100")
 c5.metric("資金流入", f"{flow}/100")
 c6.metric("Distribution", f"{dist_days}日")
-action_box(action, action_note, flow_text, flow_notes, dist_days)
+c7.metric("押し目品質", f"{pull_score}/100", pull_label)
+action_box(action, action_note, flow_text, flow_notes, dist_days, exit_count, exit_conds, pull_score, pull_label, pull_notes)
 st.metric("現在値 / 5MA乖離", f"{latest['Close']:.2f}", f"{latest['GapMA5']:.2f}%")
 
 st.markdown("### 売買マトリクス")
@@ -514,6 +635,8 @@ matrix = pd.DataFrame([
     ["利確", heat, "85以上=強い利確候補。ただし資金流入が強ければ全利確ではなく部分利確＋保有", " / ".join(sell_reasons) if sell_reasons else "-"],
     ["資金流入", flow, "75以上=機関買い継続 / 60未満=鈍化", " / ".join(flow_notes) if flow_notes else "-"],
     ["Distribution", dist_days, "0〜1日=問題小 / 2〜3日=警戒 / 4日以上=機関売り増加", flow_text],
+    ["押し目品質", pull_score, "75以上=S/A級押し目 / 50未満=追いかけ注意", pull_label + "：" + (" / ".join(pull_notes[:5]) if pull_notes else "-")],
+    ["全利確条件", exit_count, "4条件中3つ以上で全利確優位", " / ".join([("✅" if ok else "—") + name for name, ok in exit_conds])],
 ], columns=["項目", "スコア", "判定基準", "根拠"])
 st.dataframe(matrix, use_container_width=True, hide_index=True)
 
@@ -532,7 +655,7 @@ with tab1:
         st.markdown("#### 利確候補ライン")
         st.dataframe(pd.DataFrame(sell_lines, columns=["条件", "価格"]), use_container_width=True, hide_index=True)
 
-    if action in ["買い優位", "分割買い候補"]:
+    if action in ["買い優位", "分割買い候補", "押し目買い候補"]:
         st.success(f"判定：{action}。買いスコアが高く、利確過熱度はまだ高すぎません。")
     elif action in ["全利確優位", "強い利確候補", "一部利確", "部分利確＋保有"]:
         st.warning(f"判定：{action}。{action_note}")
@@ -585,6 +708,9 @@ with tab4:
         ["分配日", ad["dist"]],
         ["Distribution Day(25日)", dist_count],
         ["資金流入スコア", flow],
+        ["押し目品質スコア", pull_score],
+        ["押し目品質", pull_label],
+        ["全利確条件", f"{exit_count}/4"],
     ]
     st.dataframe(pd.DataFrame(rows, columns=["項目", "値"]), use_container_width=True, hide_index=True)
 
@@ -610,7 +736,7 @@ with tab6:
         b, _ = buy_score(dd)
         sj, ht, _ = sell_heat(dd, gain_days=surge_days)
         fl, fl_notes, ds = capital_flow_score(dd)
-        act, note = final_action_v7(b, ht, fl, ds)
+        act, note, exn, exc, ps, pl, pn = final_action_v8(dd, b, ht, fl, ds)
         h, _ = health_score(dd)
         l = dd.iloc[-1]
         ranks.append({
@@ -622,6 +748,8 @@ with tab6:
             "健康スコア": h,
             "資金流入": fl,
             "Distribution": ds,
+            "押し目品質": ps,
+            "全利確条件": exn,
             "終値": l["Close"],
             "5MA乖離%": l["GapMA5"],
             "20MA乖離%": l["GapMA20"],
@@ -631,4 +759,4 @@ with tab6:
         })
     st.dataframe(pd.DataFrame(ranks).sort_values(["買いスコア", "健康スコア"], ascending=False), use_container_width=True, hide_index=True)
 
-st.caption("投資判断補助ツールです。売買を保証するものではありません。")
+st.caption("投資判断補助ツールです。全利確優位は「過熱＋資金流出＋Distribution Day＋20MA割れ」の複合条件でのみ出します。売買を保証するものではありません。")
