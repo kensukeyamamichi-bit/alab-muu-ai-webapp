@@ -201,19 +201,6 @@ def macro_risk_score(data: Dict[str, pd.DataFrame]):
     if pd.notna(qqq1) and pd.notna(soxx1) and qqq1 > 0 and soxx1 > 0:
         score += 8; notes.append("Tech/半導体が同時に強い")
 
-    # マクロ環境：S&P500/Tech100/国債/金/長期金利で押し目の質を補正
-    macro_score, macro_label, macro_notes, macro_details = macro_risk_score(data)
-    details.update(macro_details)
-    details["マクロリスクスコア"] = macro_score
-    details["マクロ判定"] = macro_label
-    if macro_score >= 75:
-        score += 12; notes.append("マクロ環境はリスクオン")
-    elif macro_score >= 60:
-        score += 6; notes.append("マクロ環境は押し目許容")
-    elif macro_score < 45:
-        score -= 18; notes.append("金利/リスクオフで危険な押し目")
-    elif macro_score < 55:
-        score -= 6; notes.append("マクロはやや慎重")
 
     score = int(max(0, min(100, score)))
     if score >= 75:
