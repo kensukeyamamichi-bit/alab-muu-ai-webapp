@@ -7,15 +7,16 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v5", layout="wide")
+st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v6", layout="wide")
 
 st.markdown("""
-# ALAB/MUU Buy-Sell Matrix v5
-**買いポイント**と**利確ポイント**を同じ画面で見る版。  
+# ALAB/MUU Buy-Sell Matrix v6
+**買いポイント**・**利確ポイント**・**機関資金フロー**・**Distribution Day**を同じ画面で見る版。  
 目的：  
 - 買い：押し目・期待値・トレンド維持  
 - 売り：過熱度・5MA乖離・急騰後統計  
-を同時に見て、**買う / 保有 / 一部利確 / 待つ**を判断する。
+- 需給：出来高・RS・終値位置・Distribution Day  
+を同時に見て、**買う / 保有 / 一部利確 / 全利確 / 待つ**を判断する。
 """)
 
 @st.cache_data(ttl=60 * 30)
@@ -207,6 +208,118 @@ def sell_heat(d, gain_days=5):
         judge = "まだ保有優位"
     return judge, heat, reasons
 
+
+def close_location(row):
+    """終値が日中レンジのどの位置か。0=安値引け、1=高値引け。"""
+    rng = row.get("High", np.nan) - row.get("Low", np.nan)
+    if pd.isna(rng) or rng <= 0:
+        return np.nan
+    return (row.get("Close", np.nan) - row.get("Low", np.nan)) / rng
+
+def distribution_days(d, lookback=25):
+    """IBD風のDistribution Day判定。前日比下落＋出来高増加＋終値位置が弱い日を数える。"""
+    x = d.tail(lookback).copy()
+    x["CloseLoc"] = x.apply(close_location, axis=1)
+    x["DistDay"] = (
+        (x["Close"] < x["Close"].shift(1)) &
+        (x["Volume"] > x["Volume"].shift(1)) &
+        (x["CloseLoc"] <= 0.50)
+    )
+    return int(x["DistDay"].sum()), x
+
+def institutional_flow_score(d):
+    """過熱していても機関がまだ買っているかを100点で評価。"""
+    latest = d.iloc[-1]
+    score = 50
+    notes = []
+
+    vol = latest.get("VolRatio20", np.nan)
+    ret1 = latest.get("Ret1D", np.nan)
+    loc = close_location(latest)
+    rs20 = latest.get("RS_QQQ_20D", np.nan)
+    rs5 = latest.get("RS_QQQ_5D", np.nan)
+
+    if pd.notna(vol):
+        if vol >= 1.5 and pd.notna(ret1) and ret1 > 0:
+            score += 18; notes.append("出来高を伴う上昇")
+        elif vol >= 1.5 and pd.notna(ret1) and ret1 < 0:
+            score -= 22; notes.append("出来高を伴う下落")
+        elif vol >= 1.0:
+            score += 6; notes.append("出来高は平均以上")
+        else:
+            score -= 6; notes.append("出来高は平均未満")
+
+    if pd.notna(loc):
+        if loc >= 0.65:
+            score += 14; notes.append("終値位置が強い")
+        elif loc <= 0.35:
+            score -= 14; notes.append("終値位置が弱い")
+
+    if pd.notna(rs20):
+        if rs20 >= 10:
+            score += 14; notes.append("QQQ比RS20日が強い")
+        elif rs20 >= 0:
+            score += 7; notes.append("QQQ比RS20日プラス")
+        else:
+            score -= 10; notes.append("QQQ比RS20日マイナス")
+
+    if pd.notna(rs5):
+        if rs5 >= 5:
+            score += 8; notes.append("短期RSも強い")
+        elif rs5 < -3:
+            score -= 8; notes.append("短期RSが悪化")
+
+    dist_count, _ = distribution_days(d, lookback=25)
+    if dist_count <= 1:
+        score += 10; notes.append("Distribution Dayは限定的")
+    elif dist_count <= 3:
+        score -= 8; notes.append("Distribution Dayやや増加")
+    else:
+        score -= 22; notes.append("Distribution Day増加")
+
+    ad = accumulation_distribution(d, lookback=20)
+    if ad["net"] >= 3:
+        score += 8; notes.append("蓄積優勢")
+    elif ad["net"] <= -3:
+        score -= 10; notes.append("分配優勢")
+
+    score = int(max(0, min(100, score)))
+    if score >= 80:
+        label = "🟢 過熱だが機関はまだ買っている"
+    elif score >= 60:
+        label = "🟡 買いと売りが拮抗"
+    else:
+        label = "🔴 機関が売り始めている可能性"
+    return score, label, notes
+
+def distribution_label(dist_count):
+    if dist_count <= 1:
+        return "🟢 機関売りの兆候は限定的"
+    if dist_count <= 3:
+        return "🟡 やや警戒。高値更新失敗なら一部利確"
+    if dist_count == 4:
+        return "🔴 機関売り増加。利確優位"
+    return "🚨 トレンド終了注意"
+
+def enhanced_final_action(buy, heat, health, flow, dist_count):
+    if heat >= 85 and (flow < 60 or dist_count >= 3):
+        return "全利確優位", "過熱＋機関売り警戒"
+    if heat >= 85 and flow >= 80 and health >= 75 and dist_count <= 1:
+        return "部分利確＋保有", "過熱だが機関買い継続"
+    if heat >= 70 and flow >= 75:
+        return "一部利確＋保有", "利益を守りつつ上値追随"
+    if buy >= 75 and heat < 55 and flow >= 60:
+        return "買い優位", "押し目買い候補"
+    if buy >= 65 and heat < 70 and flow >= 60:
+        return "分割買い候補", "買いすぎず分割"
+    if heat >= 85:
+        return "利確優位", "短期過熱が強い"
+    if heat >= 70:
+        return "一部利確", "半分/一部を検討"
+    if buy < 45 and heat < 55:
+        return "待機", "無理しない"
+    return "保有", "売買せず観察"
+
 def final_action(buy, heat):
     if buy >= 75 and heat < 55:
         return "買い優位", "押し目買い候補"
@@ -364,25 +477,33 @@ latest = d.iloc[-1]
 
 buy, buy_reasons = buy_score(d)
 sell_judge, heat, sell_reasons = sell_heat(d, gain_days=surge_days)
-action, action_note = final_action(buy, heat)
 health, health_notes = health_score(d)
+flow, flow_label, flow_notes = institutional_flow_score(d)
+dist_count, dist_table = distribution_days(d)
+action, action_note = enhanced_final_action(buy, heat, health, flow, dist_count)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
 c1.metric("最終行動", action, action_note)
 c2.metric("買いスコア", f"{buy}/100")
 c3.metric("利確過熱度", f"{heat:.0f}/100", sell_judge)
 c4.metric("健康スコア", f"{health}/100")
-c5.metric("現在値", f"{latest['Close']:.2f}")
-c6.metric("5MA乖離", f"{latest['GapMA5']:.2f}%")
+c5.metric("資金流入", f"{flow}/100")
+c6.metric("Distribution", f"{dist_count}日", distribution_label(dist_count))
+c7.metric("現在値", f"{latest['Close']:.2f}")
+c8.metric("5MA乖離", f"{latest['GapMA5']:.2f}%")
+
+st.info(f"現在の需給判定：**{flow_label}**")
 
 st.markdown("### 売買マトリクス")
 matrix = pd.DataFrame([
     ["買い", buy, "75以上=買い優位 / 65以上=分割買い候補", " / ".join(buy_reasons) if buy_reasons else "-"],
     ["利確", heat, "85以上=利確かなり強め / 70以上=一部利確 / 55以上=警戒", " / ".join(sell_reasons) if sell_reasons else "-"],
+    ["機関資金フロー", flow, "80以上=過熱だが機関買い継続 / 60以上=拮抗 / 60未満=売り警戒", " / ".join(flow_notes) if flow_notes else "-"],
+    ["Distribution Day", dist_count, "0-1日=問題限定的 / 2-3日=警戒 / 4日以上=利確優位", distribution_label(dist_count)],
 ], columns=["項目", "スコア", "判定基準", "根拠"])
 st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["同時判定", "買い期待値", "利確統計", "銘柄カルテ", "チャート", "比較ランキング"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["同時判定", "機関需給", "買い期待値", "利確統計", "銘柄カルテ", "チャート", "比較ランキング"])
 
 with tab1:
     st.subheader("買いポイントと利確ポイントを同時表示")
@@ -405,6 +526,24 @@ with tab1:
         st.info(f"判定：{action}。今は無理に動かず観察優位です。")
 
 with tab2:
+    st.subheader("機関資金フロー / Distribution Day")
+    st.metric("機関資金フロー", f"{flow}/100", flow_label)
+    st.metric("Distribution Day（直近25営業日）", f"{dist_count}日", distribution_label(dist_count))
+    st.markdown("#### 判定文")
+    if flow >= 80 and dist_count <= 1:
+        st.success("過熱だが機関はまだ買っている。全売りより、部分利確＋保有で上値追随。")
+    elif flow < 60 or dist_count >= 3:
+        st.error("過熱に加えて機関売りの兆候。利確優位。")
+    else:
+        st.warning("買いと売りが拮抗。高値更新失敗・出来高悪化に注意。")
+    st.markdown("#### 直近25営業日のDistribution判定")
+    show_dist = dist_table.tail(25).copy()
+    show_dist["日付"] = show_dist.index.strftime("%Y-%m-%d")
+    show_dist["終値位置"] = show_dist["CloseLoc"].map(lambda x: "-" if pd.isna(x) else f"{x:.2f}")
+    show_dist["Distribution Day"] = show_dist["DistDay"].map(lambda x: "✅" if x else "")
+    st.dataframe(show_dist[["日付", "Close", "Volume", "終値位置", "Distribution Day"]].sort_values("日付", ascending=False), use_container_width=True, hide_index=True)
+
+with tab3:
     st.subheader("今買う / 押しを待つ期待値")
     et = entry_expectancy_table(d, entry_pcts=(0,3,5,8,12,15), lookahead=lookahead, target_pct=target_pct, stop_pct=stop_pct)
     show = et.copy()
@@ -413,7 +552,7 @@ with tab2:
     show["価格"] = show["価格"].map(lambda x: f"{x:.2f}")
     st.dataframe(show, use_container_width=True, hide_index=True)
 
-with tab3:
+with tab4:
     st.subheader("5MA乖離率で見る利確統計")
     gap_stats = ma_gap_profit_stats(d, ma=5, thresholds=(3,5,8,10,12,15), lookahead=lookahead, min_gap=min_gap)
     st.dataframe(gap_stats, use_container_width=True, hide_index=True)
@@ -421,7 +560,7 @@ with tab3:
     events = surge_pullback_events(d, surge_pct=10, surge_days=surge_days, lookahead=lookahead, min_gap=min_gap)
     st.dataframe(events.sort_values("シグナル日", ascending=False) if not events.empty else events, use_container_width=True, hide_index=True)
 
-with tab4:
+with tab5:
     st.subheader(f"{selected} 銘柄カルテ")
     m5, m20, m50 = ma_break_stats(d, "MA5"), ma_break_stats(d, "MA20"), ma_break_stats(d, "MA50")
     ad = accumulation_distribution(d)
@@ -450,7 +589,7 @@ with tab4:
     ]
     st.dataframe(pd.DataFrame(rows, columns=["項目", "値"]), use_container_width=True, hide_index=True)
 
-with tab5:
+with tab6:
     lookback_chart = st.selectbox("チャート期間", [90, 180, 365, 730], index=2)
     x = d.tail(lookback_chart)
     fig = go.Figure()
@@ -462,7 +601,7 @@ with tab5:
     fig.update_layout(height=560, xaxis_rangeslider_visible=False, margin=dict(l=20, r=20, t=20, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-with tab6:
+with tab7:
     st.subheader("比較ランキング")
     ranks = []
     for t, df0 in data.items():
@@ -471,8 +610,10 @@ with tab6:
         if dd.empty: continue
         b, _ = buy_score(dd)
         sj, ht, _ = sell_heat(dd, gain_days=surge_days)
-        act, note = final_action(b, ht)
         h, _ = health_score(dd)
+        fl, flabel, _ = institutional_flow_score(dd)
+        dc, _ = distribution_days(dd)
+        act, note = enhanced_final_action(b, ht, h, fl, dc)
         l = dd.iloc[-1]
         ranks.append({
             "銘柄": t,
@@ -481,6 +622,9 @@ with tab6:
             "利確過熱度": ht,
             "利確判定": sj,
             "健康スコア": h,
+            "資金流入": fl,
+            "Distribution": dc,
+            "需給判定": flabel,
             "終値": l["Close"],
             "5MA乖離%": l["GapMA5"],
             "20MA乖離%": l["GapMA20"],
