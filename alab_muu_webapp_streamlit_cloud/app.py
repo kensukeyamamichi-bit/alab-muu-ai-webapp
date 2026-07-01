@@ -7,17 +7,22 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v9", layout="wide")
+st.set_page_config(page_title="ALAB/MUU Buy-Sell Matrix v11", layout="wide")
 
 st.markdown("""
-# ALAB/MUU Buy-Sell Matrix v9
+# ALAB/MUU Buy-Sell Matrix v11
 **買いポイント**と**利確ポイント**を同じ画面で見る版。  
 目的：  
 - 買い：押し目・期待値・トレンド維持  
 - 売り：過熱度・5MA乖離・急騰後統計  
 を同時に見て、**買う / 保有 / 一部利確 / 待つ**を判断する。
 
-今回の修正：**5MA乖離率だけでは全利確にしない**。過熱度は「警戒シグナル」として扱い、**機関買い継続・ATH・RS・Distribution Day**を合わせて判定する。
+今回の修正：**5MA乖離率だけでは全利確にしない**。さらに押し目買いでは、個別銘柄だけでなく **市場全体のリバランス/指数連動の売り** を判定に入れる。
+
+追加：QQQ/SOXXの下落、出来高、月末・四半期末、ウォッチ銘柄の同時下落率から、**市場リバランス押し目** か **個別悪化** かを分ける。
+
+今回のv11追加：**S&P500（SPY）/ Tech100（QQQ）/ 半導体（SOXX）/ 長期国債（TLT）/ 金（GLD）/ 長期金利（^TNX）** をマクロ指標として組み込み、
+「リスクオンの押し目」か「金利上昇・リスクオフの危険な下げ」かを分ける。
 """)
 
 @st.cache_data(ttl=60 * 30)
@@ -121,6 +126,216 @@ def accumulation_distribution(d, lookback=20):
 
 
 
+
+
+def macro_risk_score(data: Dict[str, pd.DataFrame]):
+    """S&P500/Tech100/半導体/国債/金/長期金利から、押し目の質を判定。
+    高いほど「リスクオン環境の健全な押し目」。低いほど「金利上昇・リスクオフで危険な下げ」。
+    """
+    score = 50
+    notes = []
+    details = {}
+
+    def one_day(ticker):
+        df = data.get(ticker)
+        if df is None or df.empty or len(df.dropna(subset=["Close"])) < 25:
+            return np.nan, np.nan, np.nan
+        x = df.dropna(subset=["Close"])
+        ret1 = x["Close"].pct_change().iloc[-1] * 100
+        ret5 = x["Close"].pct_change(5).iloc[-1] * 100
+        volr = (x["Volume"] / x["Volume"].rolling(20).mean()).iloc[-1] if "Volume" in x else np.nan
+        return ret1, ret5, volr
+
+    spy1, spy5, spyv = one_day("SPY")
+    qqq1, qqq5, qqqv = one_day("QQQ")
+    soxx1, soxx5, soxxv = one_day("SOXX")
+    tlt1, tlt5, _ = one_day("TLT")
+    ief1, ief5, _ = one_day("IEF")
+    gld1, gld5, _ = one_day("GLD")
+    gold1, gold5, _ = one_day("GC=F")
+    tnx1, tnx5, _ = one_day("^TNX")
+    if pd.isna(tnx1):
+        tnx1, tnx5, _ = one_day("TNX")
+
+    # details
+    for name, val in [("S&P500(SPY)当日%", spy1), ("Tech100(QQQ)当日%", qqq1), ("半導体(SOXX)当日%", soxx1),
+                      ("長期国債(TLT)当日%", tlt1), ("中期国債(IEF)当日%", ief1), ("金(GLD/GC)当日%", gld1 if pd.notna(gld1) else gold1),
+                      ("長期金利(^TNX)当日%", tnx1)]:
+        if pd.notna(val): details[name] = val
+
+    # 株式指数の地合い
+    if pd.notna(spy1):
+        if spy1 <= -1.0: score -= 8; notes.append("S&P500が弱い")
+        elif spy1 >= 0.5: score += 6; notes.append("S&P500は底堅い")
+    if pd.notna(qqq1):
+        if qqq1 <= -1.3: score -= 10; notes.append("Tech100が弱い")
+        elif qqq1 >= 0.7: score += 8; notes.append("Tech100は強い")
+    if pd.notna(soxx1):
+        if soxx1 <= -1.8: score -= 10; notes.append("半導体全体が弱い")
+        elif soxx1 >= 1.0: score += 10; notes.append("半導体は強い")
+
+    # 金利・国債：TLT下落＋TNX上昇はグロースに逆風
+    if pd.notna(tlt1):
+        if tlt1 <= -1.0: score -= 12; notes.append("長期国債下落＝金利上昇圧力")
+        elif tlt1 >= 1.0: score += 10; notes.append("長期国債上昇＝金利低下追い風")
+    if pd.notna(ief1):
+        if ief1 <= -0.5: score -= 6; notes.append("中期国債も弱い")
+        elif ief1 >= 0.5: score += 5; notes.append("中期国債は強い")
+    if pd.notna(tnx1):
+        if tnx1 >= 1.5: score -= 14; notes.append("長期金利が上昇")
+        elif tnx1 <= -1.5: score += 12; notes.append("長期金利が低下")
+
+    # 金：株安＋金高はリスクオフ、株高＋金高はインフレ/ドル要因で中立寄り
+    gold_ret = gld1 if pd.notna(gld1) else gold1
+    if pd.notna(gold_ret):
+        if gold_ret >= 0.8 and (pd.notna(qqq1) and qqq1 < 0):
+            score -= 8; notes.append("株安＋金高＝リスクオフ気味")
+        elif gold_ret <= -0.8 and (pd.notna(qqq1) and qqq1 > 0):
+            score += 4; notes.append("金弱く株強い＝リスクオン")
+
+    # 重要な組み合わせ
+    if pd.notna(qqq1) and pd.notna(tlt1) and qqq1 < 0 and tlt1 < 0:
+        score -= 12; notes.append("株と債券が同時下落＝悪い押し目")
+    if pd.notna(qqq1) and pd.notna(tlt1) and qqq1 < 0 and tlt1 > 0:
+        score += 10; notes.append("株安でも債券高＝金利低下型の押し目")
+    if pd.notna(qqq1) and pd.notna(soxx1) and qqq1 > 0 and soxx1 > 0:
+        score += 8; notes.append("Tech/半導体が同時に強い")
+
+    # マクロ環境：S&P500/Tech100/国債/金/長期金利で押し目の質を補正
+    macro_score, macro_label, macro_notes, macro_details = macro_risk_score(data)
+    details.update(macro_details)
+    details["マクロリスクスコア"] = macro_score
+    details["マクロ判定"] = macro_label
+    if macro_score >= 75:
+        score += 12; notes.append("マクロ環境はリスクオン")
+    elif macro_score >= 60:
+        score += 6; notes.append("マクロ環境は押し目許容")
+    elif macro_score < 45:
+        score -= 18; notes.append("金利/リスクオフで危険な押し目")
+    elif macro_score < 55:
+        score -= 6; notes.append("マクロはやや慎重")
+
+    score = int(max(0, min(100, score)))
+    if score >= 75:
+        label = "リスクオン良好"
+    elif score >= 60:
+        label = "押し目許容の地合い"
+    elif score >= 45:
+        label = "中立"
+    else:
+        label = "金利/リスクオフ警戒"
+    return score, label, notes, details
+
+
+def market_rebalance_score(data: Dict[str, pd.DataFrame], selected: str):
+    """押し目買い用の市場全体リバランス判定。
+    個別悪化ではなく、指数・半導体全体・ウォッチ銘柄が同時に下げているかを見る。
+    スコアが高いほど「市場全体の需給/リバランスによる押し目」の可能性が高い。
+    """
+    if selected not in data or data[selected].empty:
+        return 50, "市場判定不可", [], {}
+
+    d = data[selected].dropna(subset=["Close"])
+    latest = d.iloc[-1]
+    score = 50
+    notes = []
+    details = {}
+
+    # 月末・四半期末は機械的なリバランス売り/買いが出やすい
+    dt = d.index[-1]
+    cal = pd.Timestamp(dt)
+    month_end = cal + pd.tseries.offsets.BMonthEnd(0)
+    days_to_month_end = (month_end.date() - cal.date()).days
+    is_month_rebalance = days_to_month_end <= 3 or cal.day <= 3
+    is_quarter_month = cal.month in [3, 6, 9, 12]
+    details["月末まで日数"] = days_to_month_end
+    if is_month_rebalance:
+        score += 10; notes.append("月末/月初リバランス期間")
+    if is_month_rebalance and is_quarter_month:
+        score += 8; notes.append("四半期末リバランス期間")
+
+    # 指数の動き：QQQ/SOXXが同時下落なら個別悪化ではなく市場要因の可能性
+    q = data.get("QQQ")
+    sx = data.get("SOXX")
+    q_ret = sx_ret = np.nan
+    q_vol = sx_vol = np.nan
+    if q is not None and not q.empty:
+        qd = q.dropna(subset=["Close"]).copy()
+        q_ret = qd["Close"].pct_change().iloc[-1] * 100
+        q_vol = (qd["Volume"] / qd["Volume"].rolling(20).mean()).iloc[-1]
+        details["QQQ当日%"] = q_ret
+        details["QQQ出来高倍率"] = q_vol
+        if q_ret <= -1.0:
+            score += 14; notes.append("QQQが1%以上下落")
+        elif q_ret >= 1.0:
+            score -= 6; notes.append("QQQは強い")
+        if pd.notna(q_vol) and q_vol >= 1.25 and q_ret < 0:
+            score += 8; notes.append("QQQ下落日に出来高増")
+
+    if sx is not None and not sx.empty:
+        sd = sx.dropna(subset=["Close"]).copy()
+        sx_ret = sd["Close"].pct_change().iloc[-1] * 100
+        sx_vol = (sd["Volume"] / sd["Volume"].rolling(20).mean()).iloc[-1]
+        details["SOXX当日%"] = sx_ret
+        details["SOXX出来高倍率"] = sx_vol
+        if sx_ret <= -1.5:
+            score += 16; notes.append("SOXXが1.5%以上下落")
+        elif sx_ret >= 1.5:
+            score -= 8; notes.append("SOXXは強い")
+        if pd.notna(sx_vol) and sx_vol >= 1.25 and sx_ret < 0:
+            score += 8; notes.append("SOXX下落日に出来高増")
+
+    # ウォッチ銘柄全体の同時下落率・上昇率
+    watch = [t for t in data.keys() if t not in ["QQQ", "SOXX", "SPY", "TLT", "IEF", "GLD", "GC=F", "^TNX", "TNX"]]
+    rets, above20, above50 = [], [], []
+    for t in watch:
+        x = data[t].dropna(subset=["Close"])
+        if len(x) < 60:
+            continue
+        r = x["Close"].pct_change().iloc[-1] * 100
+        rets.append(r)
+        above20.append(bool(x["Close"].iloc[-1] > x["MA20"].iloc[-1]))
+        above50.append(bool(x["Close"].iloc[-1] > x["MA50"].iloc[-1]))
+    if rets:
+        down_ratio = sum(r < 0 for r in rets) / len(rets)
+        big_down_ratio = sum(r <= -3 for r in rets) / len(rets)
+        details["ウォッチ同時下落率%"] = down_ratio * 100
+        details["ウォッチ3%以上下落率%"] = big_down_ratio * 100
+        details["20MA上比率%"] = np.mean(above20) * 100 if above20 else np.nan
+        details["50MA上比率%"] = np.mean(above50) * 100 if above50 else np.nan
+        if down_ratio >= 0.65:
+            score += 18; notes.append("ウォッチ銘柄が同時下落")
+        elif down_ratio <= 0.35:
+            score -= 10; notes.append("市場全体は崩れていない")
+        if big_down_ratio >= 0.35:
+            score += 10; notes.append("高ベータ銘柄に広範な売り")
+
+    # 個別だけ極端に弱い場合はリバランスではなく個別悪化として減点
+    sel_ret = latest.get("Ret1D", np.nan)
+    if pd.notna(sel_ret):
+        details[f"{selected}当日%"] = sel_ret
+        idx_ref = np.nan
+        if pd.notna(sx_ret): idx_ref = sx_ret
+        elif pd.notna(q_ret): idx_ref = q_ret
+        if pd.notna(idx_ref):
+            rel = sel_ret - idx_ref
+            details["個別-指数%"] = rel
+            if rel <= -4:
+                score -= 22; notes.append("個別が指数より大きく弱い")
+            elif rel >= 2:
+                score += 8; notes.append("個別は指数より耐えている")
+
+    score = int(max(0, min(100, score)))
+    if score >= 75:
+        label = "市場リバランス押し目の可能性高い"
+    elif score >= 60:
+        label = "市場要因の押し目寄り"
+    elif score >= 45:
+        label = "市場/個別どちらもあり"
+    else:
+        label = "個別要因・弱さに注意"
+    return score, label, notes, details
+
 def distribution_days(d, lookback=25):
     """IBD風のDistribution Day: 下落＋出来高増＋終値が日中レンジ下位50%。直近25営業日でカウント。"""
     x = d.tail(lookback).copy()
@@ -196,7 +411,7 @@ def capital_flow_score(d):
     return int(max(0, min(100, score))), notes, dist_count
 
 
-def pullback_quality_score(d):
+def pullback_quality_score(d, market_rebalance=50):
     """週足/日足の押し目買い思想を日足データで近似。
     高値追いではなく、強いトレンド内で短期線〜中期線に近づいた時を高評価。
     """
@@ -247,6 +462,15 @@ def pullback_quality_score(d):
             score += 7; notes.append("反発出来高あり")
         elif vol >= 1.5 and latest.get("Ret1D", 0) < 0:
             score -= 12; notes.append("下落出来高あり")
+
+    # 市場全体のリバランス/指数連動売りなら、強い銘柄の押し目として加点。
+    # 逆に市場が強いのに個別だけ下げている場合は減点。
+    if market_rebalance >= 75:
+        score += 18; notes.append("市場リバランス由来の押し目")
+    elif market_rebalance >= 60:
+        score += 10; notes.append("市場要因の押し目寄り")
+    elif market_rebalance < 45 and latest.get("Ret1D", 0) < 0:
+        score -= 15; notes.append("個別要因の下落に注意")
 
     score = int(max(0, min(100, score)))
     if score >= 80:
@@ -387,12 +611,12 @@ def flow_label(flow, heat, dist_days):
         return "🟡 資金流入が鈍化"
     return "🟡 買いと売りが拮抗"
 
-def final_action_v8(d, buy, heat, flow=80, dist_days=0):
+def final_action_v8(d, buy, heat, flow=80, dist_days=0, market_rebalance=50):
     # 全利確は5条件中4つ以上。5MA乖離・過熱だけでは絶対に全利確にしない。
     trend_score, trend_label, trend_notes = trend_continuation_score(d)
     context = market_context_label(d, heat, trend_score, flow, dist_days)
     exit_count, exit_conds = full_exit_conditions(d, heat, flow, dist_days, trend_score)
-    pull_score, pull_label, pull_notes = pullback_quality_score(d)
+    pull_score, pull_label, pull_notes = pullback_quality_score(d, market_rebalance)
 
     if exit_count >= 4:
         return "全利確優位", "過熱だけでなく、資金流出・Distribution Day・20MA割れのうち複数が重なっています。トレンド終了リスクが高いため全利確を検討。", exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context
@@ -420,7 +644,7 @@ def final_action_v8(d, buy, heat, flow=80, dist_days=0):
 
     return "保有", "トレンド継続。売買せず観察。", exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context
 
-def action_box(action, comment, flow_text, flow_notes, dist_days, exit_count=None, exit_conds=None, pull_score=None, pull_label=None, pull_notes=None, trend_score=None, trend_label=None, trend_notes=None, context=None):
+def action_box(action, comment, flow_text, flow_notes, dist_days, exit_count=None, exit_conds=None, pull_score=None, pull_label=None, pull_notes=None, trend_score=None, trend_label=None, trend_notes=None, context=None, market_score=None, market_label=None, market_notes=None):
     notes = " / ".join(flow_notes[:6]) if flow_notes else "-"
     cond_text = ""
     if exit_conds is not None:
@@ -438,6 +662,14 @@ def action_box(action, comment, flow_text, flow_notes, dist_days, exit_count=Non
         trend_text = f"""
         <div class="small-title">トレンド継続：{trend_score}/100｜{trend_label}</div>
         <div class="muted">局面判定：{context or '-'}<br>根拠：{tnotes}</div>
+        """
+
+    market_text = ""
+    if market_score is not None:
+        mnotes = " / ".join((market_notes or [])[:6]) or "-"
+        market_text = f"""
+        <div class="small-title">市場リバランス：{market_score}/100｜{market_label}</div>
+        <div class="muted">{mnotes}</div>
         """
 
     pull_text = ""
@@ -473,6 +705,7 @@ def action_box(action, comment, flow_text, flow_notes, dist_days, exit_count=Non
       <div class="small-title">Distribution Day：{dist_days}日 / 直近25営業日</div>
       <div class="muted">資金フロー根拠：{notes}</div>
       {trend_text}
+      {market_text}
       {cond_text}
       {pull_text}
     </div>
@@ -693,7 +926,7 @@ def fmt(v, nd=2):
 
 with st.sidebar:
     st.header("設定")
-    tickers_text = st.text_input("取得銘柄", "ALAB MUU MRVL NVDA CRDO QQQ SOXX SOXL")
+    tickers_text = st.text_input("取得銘柄", "ALAB MUU MRVL NVDA CRDO LITE COHR AAOI QQQ SPY SOXX SOXL TLT IEF GLD ^TNX IWM")
     tickers = [x.strip().upper() for x in tickers_text.split() if x.strip()]
     period = st.selectbox("取得期間", ["1y", "2y", "5y"], index=1)
     selected = st.selectbox("表示銘柄", tickers, index=0)
@@ -727,11 +960,13 @@ latest = d.iloc[-1]
 buy, buy_reasons = buy_score(d)
 sell_judge, heat, sell_reasons = sell_heat(d, gain_days=surge_days)
 flow, flow_notes, dist_days = capital_flow_score(d)
+market_score, market_label, market_notes, market_details = market_rebalance_score(data, selected)
+macro_score, macro_label, macro_notes, macro_details = macro_risk_score(data)
 flow_text = flow_label(flow, heat, dist_days)
-action, action_note, exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context = final_action_v8(d, buy, heat, flow, dist_days)
+action, action_note, exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context = final_action_v8(d, buy, heat, flow, dist_days, market_score)
 health, health_notes = health_score(d)
 
-c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns(10)
 c1.metric("最終行動", action)
 c2.metric("買いスコア", f"{buy}/100")
 c3.metric("利確過熱度", f"{heat:.0f}/100", sell_judge)
@@ -740,7 +975,9 @@ c5.metric("資金流入", f"{flow}/100")
 c6.metric("Distribution", f"{dist_days}日")
 c7.metric("押し目品質", f"{pull_score}/100", pull_label)
 c8.metric("トレンド継続", f"{trend_score}/100", trend_label)
-action_box(action, action_note, flow_text, flow_notes, dist_days, exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context)
+c9.metric("市場リバランス", f"{market_score}/100", market_label)
+c10.metric("マクロ地合い", f"{macro_score}/100", macro_label)
+action_box(action, action_note, flow_text, flow_notes, dist_days, exit_count, exit_conds, pull_score, pull_label, pull_notes, trend_score, trend_label, trend_notes, context, market_score, market_label, market_notes)
 st.metric("現在値 / 5MA乖離", f"{latest['Close']:.2f}", f"{latest['GapMA5']:.2f}%")
 
 st.markdown("### 売買マトリクス")
@@ -749,6 +986,8 @@ matrix = pd.DataFrame([
     ["過熱度", heat, "5MA乖離・急騰は警戒シグナル。単独では全利確にしない", " / ".join(sell_reasons) if sell_reasons else "-"],
     ["資金流入", flow, "75以上=機関買い継続 / 60未満=鈍化", " / ".join(flow_notes) if flow_notes else "-"],
     ["Distribution", dist_days, "0〜1日=問題小 / 2〜3日=警戒 / 4日以上=機関売り増加", flow_text],
+    ["市場リバランス", market_score, "75以上=市場起因の押し目 / 45未満=個別悪化注意", market_label + "：" + (" / ".join(market_notes[:5]) if market_notes else "-")],
+    ["マクロ地合い", macro_score, "75以上=リスクオン / 45未満=金利・リスクオフ警戒", macro_label + "：" + (" / ".join(macro_notes[:5]) if macro_notes else "-")],
     ["押し目品質", pull_score, "75以上=S/A級押し目 / 50未満=追いかけ注意", pull_label + "：" + (" / ".join(pull_notes[:5]) if pull_notes else "-")],
     ["トレンド継続", trend_score, "75以上=過熱でも保有優位 / 60未満=鈍化", trend_label + "：" + (" / ".join(trend_notes[:5]) if trend_notes else "-")],
     ["局面判定", "-", "イベント出尽くし型かトレンド型か", context],
@@ -760,6 +999,16 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["同時判定", "買い期待値",
 
 with tab1:
     st.subheader("買いポイントと利確ポイントを同時表示")
+    st.markdown("#### 市場全体のリバランス判定")
+    md = pd.DataFrame([[k, v] for k, v in market_details.items()], columns=["指標", "値"])
+    if not md.empty:
+        st.dataframe(md, use_container_width=True, hide_index=True)
+    st.info(f"{market_label}：" + (" / ".join(market_notes[:6]) if market_notes else "判定材料不足"))
+    st.markdown("#### マクロ地合い：S&P500 / Tech100 / 国債 / 金 / 長期金利")
+    mac = pd.DataFrame([[k, v] for k, v in macro_details.items()], columns=["指標", "値"])
+    if not mac.empty:
+        st.dataframe(mac, use_container_width=True, hide_index=True)
+    st.info(f"{macro_label}：" + (" / ".join(macro_notes[:6]) if macro_notes else "判定材料不足"))
     price = float(latest["Close"])
     buy_lines = [[f"{pct}%押し", price*(1-pct/100)] for pct in [3,5,8,12,15]]
     sell_lines = [[f"+{pct}%利確", price*(1+pct/100)] for pct in [5,8,10,15,20]]
@@ -824,6 +1073,10 @@ with tab4:
         ["分配日", ad["dist"]],
         ["Distribution Day(25日)", dist_count],
         ["資金流入スコア", flow],
+        ["市場リバランススコア", market_score],
+        ["市場リバランス", market_label],
+        ["マクロ地合いスコア", macro_score],
+        ["マクロ地合い", macro_label],
         ["押し目品質スコア", pull_score],
         ["押し目品質", pull_label],
         ["トレンド継続スコア", trend_score],
@@ -849,13 +1102,14 @@ with tab6:
     st.subheader("比較ランキング")
     ranks = []
     for t, df0 in data.items():
-        if t in ["QQQ", "SOXX"]: continue
+        if t in ["QQQ", "SOXX", "SPY", "TLT", "IEF", "GLD", "GC=F", "^TNX", "TNX"]: continue
         dd = df0.dropna(subset=["Close"])
         if dd.empty: continue
         b, _ = buy_score(dd)
         sj, ht, _ = sell_heat(dd, gain_days=surge_days)
         fl, fl_notes, ds = capital_flow_score(dd)
-        act, note, exn, exc, ps, pl, pn, ts, tl, tn, cx = final_action_v8(dd, b, ht, fl, ds)
+        ms, ml, mn, md = market_rebalance_score(data, t)
+        act, note, exn, exc, ps, pl, pn, ts, tl, tn, cx = final_action_v8(dd, b, ht, fl, ds, ms)
         h, _ = health_score(dd)
         l = dd.iloc[-1]
         ranks.append({
@@ -867,6 +1121,10 @@ with tab6:
             "健康スコア": h,
             "資金流入": fl,
             "Distribution": ds,
+            "市場リバランス": ms,
+            "市場判定": ml,
+            "マクロ地合い": macro_score,
+            "マクロ判定": macro_label,
             "押し目品質": ps,
             "トレンド継続": ts,
             "局面": cx,
@@ -880,4 +1138,4 @@ with tab6:
         })
     st.dataframe(pd.DataFrame(ranks).sort_values(["買いスコア", "健康スコア"], ascending=False), use_container_width=True, hide_index=True)
 
-st.caption("投資判断補助ツールです。全利確優位は「過熱＋資金流出＋Distribution Day＋20MA割れ＋トレンド鈍化」の複合条件でのみ出します。5MA乖離率は警戒シグナルであり、単独の売却理由ではありません。売買を保証するものではありません。")
+st.caption("投資判断補助ツールです。全利確優位は「過熱＋資金流出＋Distribution Day＋20MA割れ＋トレンド鈍化」の複合条件でのみ出します。5MA乖離率は警戒シグナルであり、単独の売却理由ではありません。押し目買いは、市場リバランス/指数連動売りと個別悪化を分け、S&P500・Tech100・国債・金・長期金利でマクロ地合いも確認します。売買を保証するものではありません。")
